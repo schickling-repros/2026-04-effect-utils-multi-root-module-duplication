@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Reproduces the multi-install-root module duplication issue.
 #
-# Simulates the workspace layout that mk-pnpm-cli produces:
-#   workspace/
-#     node_modules/effect@3.21.0           ← from root install root
-#     repos/lib-workspace/
-#       node_modules/effect@3.21.0         ← from external install root (DUPLICATE)
-#       packages/my-lib/                   ← workspace package using effect
-#     app/                                 ← CLI entry point using effect
+# Simulates the workspace layout that mk-pnpm-cli produces after restoring
+# two independent pnpm install roots. Uses pnpm (not bun install) to match
+# the real .pnpm virtual store layout.
 #
-# Then bundles with `bun build --compile` and checks for duplicate singletons.
+#   workspace/
+#     node_modules/.pnpm/effect@3.21.0/...           ← root install root
+#     repos/lib-workspace/
+#       node_modules/.pnpm/effect@3.21.0/...         ← external install root
+#       packages/my-lib/                              ← lib using @effect/platform
+#     app/                                            ← CLI entry point
 
 set -euo pipefail
 
@@ -17,87 +18,177 @@ WORKDIR=$(mktemp -d)
 trap 'rm -rf "$WORKDIR"' EXIT
 cd "$WORKDIR"
 
-echo "=== Setting up simulated multi-root workspace ==="
+echo "=== Setting up simulated multi-root workspace (pnpm) ==="
+
+EFFECT_VERSION="3.21.0"
+PLATFORM_VERSION="0.96.0"
+PLATFORM_NODE_VERSION="0.106.0"
 
 # --- Root install root ---
-cat > package.json << 'EOF'
-{ "name": "root", "private": true, "type": "module", "dependencies": { "effect": "3.21.0" } }
+cat > package.json << EOF
+{
+  "name": "root-workspace",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "effect": "$EFFECT_VERSION",
+    "@effect/platform": "$PLATFORM_VERSION",
+    "@effect/platform-node": "$PLATFORM_NODE_VERSION"
+  }
+}
 EOF
-bun install --frozen-lockfile 2>/dev/null || bun install
+cat > pnpm-workspace.yaml << 'EOF'
+packages:
+  - app
+EOF
+pnpm install 2>&1 | tail -3
 
-# --- External install root (simulates repos/effect-utils) ---
+# --- External install root (simulates repos/effect-utils after separate pnpm install) ---
 mkdir -p repos/lib-workspace/packages/my-lib/src
 pushd repos/lib-workspace > /dev/null
-cat > package.json << 'EOF'
-{ "name": "lib-workspace", "private": true, "type": "module", "dependencies": { "effect": "3.21.0" } }
+cat > package.json << EOF
+{
+  "name": "lib-workspace-root",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "effect": "$EFFECT_VERSION",
+    "@effect/platform": "$PLATFORM_VERSION",
+    "@effect/platform-node": "$PLATFORM_NODE_VERSION"
+  }
+}
 EOF
-bun install --frozen-lockfile 2>/dev/null || bun install
+cat > pnpm-workspace.yaml << 'EOF'
+packages:
+  - packages/my-lib
+EOF
+# my-lib declares effect + @effect/platform as workspace deps
+cat > packages/my-lib/package.json << EOF
+{
+  "name": "my-lib",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": { ".": "./src/mod.ts" },
+  "dependencies": {
+    "effect": "$EFFECT_VERSION",
+    "@effect/platform": "$PLATFORM_VERSION",
+    "@effect/platform-node": "$PLATFORM_NODE_VERSION"
+  }
+}
+EOF
+pnpm install 2>&1 | tail -3
 popd > /dev/null
 
-# Library that creates a singleton using Effect.globalValue (from external root's effect)
-cat > repos/lib-workspace/packages/my-lib/package.json << 'EOF'
-{ "name": "my-lib", "version": "0.1.0", "type": "module", "exports": { ".": "./src/mod.ts" } }
-EOF
-
+# --- Library source (resolves from external root's node_modules) ---
 cat > repos/lib-workspace/packages/my-lib/src/mod.ts << 'EOF'
-import { Context, Effect, Layer } from "effect"
+import { HttpClient, HttpClientRequest } from "@effect/platform"
+import { NodeHttpClient } from "@effect/platform-node"
+import { Effect, Layer } from "effect"
 
-// Create a service tag — this will use the external root's Effect copy
-export class MyService extends Context.Tag("repro/MyService")<MyService, { readonly value: number }>() {}
-
-// A layer that provides the service — created using the external root's Effect
-export const MyServiceLive = Layer.succeed(MyService, { value: 42 })
-
-// A program that consumes the service — also using the external root's Effect
-export const program = Effect.gen(function* () {
-  const svc = yield* MyService
-  return svc.value
+/**
+ * Simulates the RPC client layer from discord-agent.
+ * Creates a layer that:
+ * 1. Reads HttpClient from the fiber context (tag from external root's @effect/platform)
+ * 2. Makes an HTTP request using that client
+ */
+export const makeHttpCall = Effect.gen(function* () {
+  const client = yield* HttpClient.HttpClient
+  return `got HttpClient: ${typeof client}`
 })
+
+/** Layer that provides HttpClient via NodeHttpClient (from external root) */
+export const httpLayer = NodeHttpClient.layer
 EOF
 
-# App entry point — uses the ROOT's effect to run the program
+# --- App entry point (resolves from root's node_modules) ---
 mkdir -p app
+cat > app/package.json << EOF
+{
+  "name": "app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "effect": "$EFFECT_VERSION",
+    "@effect/platform": "$PLATFORM_VERSION",
+    "@effect/platform-node": "$PLATFORM_NODE_VERSION",
+    "my-lib": "link:../repos/lib-workspace/packages/my-lib"
+  }
+}
+EOF
+
 cat > app/main.ts << 'EOF'
+import { FetchHttpClient, HttpClient } from "@effect/platform"
+import { NodeHttpClient } from "@effect/platform-node"
 import { Effect } from "effect"
-import { MyServiceLive, program } from "../repos/lib-workspace/packages/my-lib/src/mod.ts"
+import { httpLayer, makeHttpCall } from "../repos/lib-workspace/packages/my-lib/src/mod.ts"
 
-// The app provides and runs using the root's Effect copy.
-// If the two Effect copies have incompatible internals, this may fail.
-const main = program.pipe(Effect.provide(MyServiceLive))
-
-Effect.runPromise(main).then(
-  (result) => console.log(`SUCCESS: got value ${result}`),
+// Test 1: App provides its own HttpClient, lib's code consumes it.
+// If the two effect copies have incompatible HttpClient tags, this fails.
+console.log("Test 1: Root provides FetchHttpClient → lib reads HttpClient...")
+await Effect.runPromise(
+  makeHttpCall.pipe(Effect.provide(FetchHttpClient.layer), Effect.scoped),
+).then(
+  (msg) => console.log(`  ✅ PASS: ${msg}`),
   (e) => {
     const msg = e instanceof Error ? e.message : String(e)
-    // Check for the characteristic "Service not found" error
     if (msg.includes("Service not found")) {
-      console.error("FAILURE: Service not found — module identity mismatch between Effect copies")
+      console.log(`  ❌ FAIL: ${msg.split("\n")[0]}`)
     } else {
-      console.error("FAILURE:", msg.slice(0, 200))
+      console.log(`  ❌ FAIL: ${msg.slice(0, 200)}`)
     }
-    process.exit(1)
   },
 )
+
+// Test 2: Lib provides its own HttpClient layer, app just runs the effect.
+// Both sides from the same (external) copy — should work regardless.
+console.log("Test 2: Lib provides its own NodeHttpClient layer...")
+await Effect.runPromise(
+  makeHttpCall.pipe(Effect.provide(httpLayer), Effect.scoped),
+).then(
+  (msg) => console.log(`  ✅ PASS: ${msg}`),
+  (e) => {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (msg.includes("Service not found")) {
+      console.log(`  ❌ FAIL: ${msg.split("\n")[0]}`)
+    } else {
+      console.log(`  ❌ FAIL: ${msg.slice(0, 200)}`)
+    }
+  },
+)
+
+// Test 3: Same-copy baseline — app provides and consumes its own HttpClient.
+console.log("Test 3: Root provides and consumes its own HttpClient (baseline)...")
+await Effect.runPromise(
+  Effect.gen(function* () {
+    const client = yield* HttpClient.HttpClient
+    return `got HttpClient: ${typeof client}`
+  }).pipe(Effect.provide(FetchHttpClient.layer), Effect.scoped),
+).then(
+  (msg) => console.log(`  ✅ PASS: ${msg}`),
+  (e) => console.log(`  ❌ FAIL: ${String(e).slice(0, 200)}`),
+)
 EOF
+
+# Reinstall root workspace (picks up the app package)
+pnpm install 2>&1 | tail -3
 
 echo ""
 echo "=== Bundling with bun build --compile ==="
 bun build app/main.ts --compile --outfile ./repro-binary 2>&1 | tail -3
 
 echo ""
-echo "=== Checking for duplicate Effect singletons in bundle ==="
-# TagProto is the prototype used by Context.Tag — multiple copies = multiple tag registries
+echo "=== Checking for duplicate Effect modules in bundle ==="
 tagproto_count=$(strings ./repro-binary | grep -c 'var TagProto' || true)
-echo "TagProto definitions: $tagproto_count (expected: 1)"
-strings ./repro-binary | grep 'var TagProto' | head -5
-
-# Check for duplicate GenericTag functions
 generictag_count=$(strings ./repro-binary | grep -c 'var GenericTag' || true)
-echo "GenericTag definitions: $generictag_count (expected: 1)"
+httpclient_tag_count=$(strings ./repro-binary | grep -c 'GenericTag("@effect/platform/HttpClient")' || true)
+echo "TagProto definitions:       $tagproto_count (expected: 1)"
+echo "GenericTag functions:       $generictag_count (expected: 1)"
+echo "HttpClient tag definitions: $httpclient_tag_count (expected: 1)"
 
-# Check for duplicate effect/Context module copies
-context_copies=$(strings ./repro-binary | grep -c 'effect/Context/Tag' || true)
-echo "effect/Context/Tag symbol definitions: $context_copies (expected: 1)"
+echo ""
+echo "=== Source paths in bundle (showing duplication origin) ==="
+strings ./repro-binary | grep "node_modules.*effect/dist" | sort -u | head -6
 
 echo ""
 echo "=== Running bundled binary ==="
@@ -105,16 +196,7 @@ echo "=== Running bundled binary ==="
 
 echo ""
 if [ "$tagproto_count" -gt 1 ]; then
-  echo "❌ BUG CONFIRMED: Bundle contains $tagproto_count Effect copies"
-  echo ""
-  echo "Even though this simple test may pass (Context.Tag uses string keys),"
-  echo "the duplication breaks more complex patterns like @effect/rpc's Protocol"
-  echo "service which relies on module-level singletons for serialization state."
-  echo ""
-  echo "In the real scenario (discord-agent CLI), this causes:"
-  echo "  Service not found: @effect/platform/HttpClient"
-  echo "when RPC client code (bundled from root's effect) tries to find HttpClient"
-  echo "provided through a layer composed with the external root's effect."
+  echo "❌ DUPLICATION CONFIRMED: $tagproto_count Effect copies in bundle"
 else
   echo "✅ No duplication detected"
 fi
