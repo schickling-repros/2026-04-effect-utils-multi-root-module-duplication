@@ -42,4 +42,4 @@ The bundler treats each physical copy as a distinct module, creating duplicate s
 
 ## Related Issue
 
-TBD
+https://github.com/overengineeringstudio/effect-utils/issues/538
